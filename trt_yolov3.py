@@ -21,6 +21,10 @@ from utils.visualization import BBoxVisualization
 
 WINDOW_NAME = 'TrtYOLOv3Demo'
 
+fourcc = cv2.VideoWriter_fourcc(*'XVID')
+out = cv2.VideoWriter('output.avi',fourcc, 20.0, (1920,1080))
+
+# 
 
 def parse_args():
     """Parse input arguments."""
@@ -29,7 +33,7 @@ def parse_args():
             'YOLOv3 model on Jetson Nano')
     parser = argparse.ArgumentParser(description=desc)
     parser = add_camera_args(parser)
-    parser.add_argument('--model', type=str, default='yolov3-416',
+    parser.add_argument('--model', type=str, default='yolov3-608',
                         choices=['yolov3-288', 'yolov3-416', 'yolov3-608',
                                  'yolov3-tiny-288', 'yolov3-tiny-416'])
     args = parser.parse_args()
@@ -54,9 +58,19 @@ def loop_and_detect(cam, trt_yolov3, conf_th, vis):
         img = cam.read()
         if img is not None:
             boxes, confs, clss = trt_yolov3.detect(img, conf_th)
+            # print(boxes, confs, clss)
+            for target_list1, target_list2 in zip(boxes,confs):
+                pass
+                # print(target_list2)
+                print("BoundingBoxes: {} , CenterPoint: {},  ConfidenceScore: {}%".format(target_list1,
+                (int((target_list1[0]+target_list1[2])/2),int((target_list1[1]+target_list1[3])/2)),int(target_list2*100)))
+                
             img = vis.draw_bboxes(img, boxes, confs, clss)
             img = show_fps(img, fps)
+            print("Fps",fps,img.shape)
+            out.write(img)
             cv2.imshow(WINDOW_NAME, img)
+            # cv2.imwrite(str(tic)+".jpg",img)
             toc = time.time()
             curr_fps = 1.0 / (toc - tic)
             # calculate an exponentially decaying average of fps number

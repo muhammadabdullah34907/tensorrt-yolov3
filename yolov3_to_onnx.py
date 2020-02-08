@@ -1,21 +1,69 @@
-#!/usr/bin/env python2
+# yolov3_to_onnx.py
+#
+# Copyright 1993-2019 NVIDIA Corporation.  All rights reserved.
+#
+# NOTICE TO LICENSEE:
+#
+# This source code and/or documentation ("Licensed Deliverables") are
+# subject to NVIDIA intellectual property rights under U.S. and
+# international Copyright laws.
+#
+# These Licensed Deliverables contained herein is PROPRIETARY and
+# CONFIDENTIAL to NVIDIA and is being provided under the terms and
+# conditions of a form of NVIDIA software license agreement by and
+# between NVIDIA and Licensee ("License Agreement") or electronically
+# accepted by Licensee.  Notwithstanding any terms or conditions to
+# the contrary in the License Agreement, reproduction or disclosure
+# of the Licensed Deliverables to any third party without the express
+# written consent of NVIDIA is prohibited.
+#
+# NOTWITHSTANDING ANY TERMS OR CONDITIONS TO THE CONTRARY IN THE
+# LICENSE AGREEMENT, NVIDIA MAKES NO REPRESENTATION ABOUT THE
+# SUITABILITY OF THESE LICENSED DELIVERABLES FOR ANY PURPOSE.  IT IS
+# PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY OF ANY KIND.
+# NVIDIA DISCLAIMS ALL WARRANTIES WITH REGARD TO THESE LICENSED
+# DELIVERABLES, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY,
+# NONINFRINGEMENT, AND FITNESS FOR A PARTICULAR PURPOSE.
+# NOTWITHSTANDING ANY TERMS OR CONDITIONS TO THE CONTRARY IN THE
+# LICENSE AGREEMENT, IN NO EVENT SHALL NVIDIA BE LIABLE FOR ANY
+# SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, OR ANY
+# DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+# WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS
+# ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE
+# OF THESE LICENSED DELIVERABLES.
+#
+# U.S. Government End Users.  These Licensed Deliverables are a
+# "commercial item" as that term is defined at 48 C.F.R. 2.101 (OCT
+# 1995), consisting of "commercial computer software" and "commercial
+# computer software documentation" as such terms are used in 48
+# C.F.R. 12.212 (SEPT 1995) and is provided to the U.S. Government
+# only as a commercial end item.  Consistent with 48 C.F.R.12.212 and
+# 48 C.F.R. 227.7202-1 through 227.7202-4 (JUNE 1995), all
+# U.S. Government End Users acquire the Licensed Deliverables with
+# only those rights set forth herein.
+#
+# Any use of the Licensed Deliverables in individual and commercial
+# software must include, in the user documentation and internal
+# comments to the code, the above Disclaimer and U.S. Government End
+# Users Notice.
+#
+
 
 from __future__ import print_function
-from collections import OrderedDict
-import hashlib
-import os.path
 
-import wget
+import sys
+import hashlib
+import argparse
+from collections import OrderedDict
 
 import onnx
 from onnx import helper
 from onnx import TensorProto
 import numpy as np
 
-# import sys
 
 class DarkNetParser(object):
-    """Definition of a parser for DarkNet-based YOLOv3-608 (only tested for this topology)."""
+    """Definition of a parser for DarkNet-based YOLOv3."""
 
     def __init__(self, supported_layers):
         """Initializes a DarkNetParser object.
@@ -38,7 +86,7 @@ class DarkNetParser(object):
         Keyword argument:
         cfg_file_path -- path to the yolov3.cfg file as string
         """
-        with open(cfg_file_path, 'rb') as cfg_file:
+        with open(cfg_file_path, 'r') as cfg_file:
             remainder = cfg_file.read()
             while remainder is not None:
                 layer_dict, layer_name, remainder = self._next_layer(remainder)
@@ -183,6 +231,24 @@ class ConvParams(object):
         param_name = self.node_name + '_' + param_category + '_' + suffix
         return param_name
 
+class UpsampleParams(object):
+    #Helper class to store the scale parameter for an Upsample node.
+
+    def __init__(self, node_name, value):
+        """Constructor based on the base node name (e.g. 86_Upsample),
+        and the value of the scale input tensor.
+
+        Keyword arguments:
+        node_name -- base name of this YOLO Upsample layer
+        value -- the value of the scale input to the Upsample layer as a numpy array
+        """
+        self.node_name = node_name
+        self.value = value
+
+    def generate_param_name(self):
+        """Generates the scale parameter name for the Upsample node."""
+        param_name = self.node_name + '_' + 'scale'
+        return param_name
 
 class WeightLoader(object):
     """Helper class used for loading the serialized weights of a binary file stream
@@ -197,6 +263,27 @@ class WeightLoader(object):
         weights_file_path -- path to the weights file.
         """
         self.weights_file = self._open_weights_file(weights_file_path)
+
+    def load_upsample_scales(self, upsample_params):
+        """Returns the initializers with the value of the scale input
+        tensor given by upsample_params.
+
+        Keyword argument:
+        upsample_params -- a UpsampleParams object
+        """
+        initializer = list()
+        inputs = list()
+        name = upsample_params.generate_param_name()
+        shape = upsample_params.value.shape
+        data = upsample_params.value
+        scale_init = helper.make_tensor(
+            name, TensorProto.FLOAT, shape, data)
+        scale_input = helper.make_tensor_value_info(
+            name, TensorProto.FLOAT, shape)
+        initializer.append(scale_init)
+        inputs.append(scale_input)
+        return initializer, inputs
+
 
     def load_conv_weights(self, conv_params):
         """Returns the initializers with weights from the weights file and
@@ -293,7 +380,7 @@ class WeightLoader(object):
 class GraphBuilderONNX(object):
     """Class for creating an ONNX graph from a previously generated list of layer dictionaries."""
 
-    def __init__(self, output_tensors):
+    def __init__(self, model_name, output_tensors):
         """Initialize with all DarkNet default parameters used creating YOLOv3,
         and specify the output tensors as an OrderedDict for their output dimensions
         with their names as keys.
@@ -302,6 +389,7 @@ class GraphBuilderONNX(object):
         output_tensors -- the output tensors as an OrderedDict containing the keys'
         output dimensions
         """
+        self.model_name = model_name
         self.output_tensors = output_tensors
         self._nodes = list()
         self.graph_def = None
@@ -342,18 +430,24 @@ class GraphBuilderONNX(object):
         inputs = [self.input_tensor]
         weight_loader = WeightLoader(weights_file_path)
         initializer = list()
+        # If a layer has parameters, add them to the initializer and input lists.
         for layer_name in self.param_dict.keys():
             _, layer_type = layer_name.split('_', 1)
-            conv_params = self.param_dict[layer_name]
-            assert layer_type == 'convolutional'
-            initializer_layer, inputs_layer = weight_loader.load_conv_weights(
-                conv_params)
-            initializer.extend(initializer_layer)
-            inputs.extend(inputs_layer)
+            params = self.param_dict[layer_name]
+            if layer_type == 'convolutional':
+                initializer_layer, inputs_layer = weight_loader.load_conv_weights(
+                    params)
+                initializer.extend(initializer_layer)
+                inputs.extend(inputs_layer)
+            elif layer_type == 'upsample':
+                initializer_layer, inputs_layer = weight_loader.load_upsample_scales(
+                    params)
+                initializer.extend(initializer_layer)
+                inputs.extend(inputs_layer)
         del weight_loader
         self.graph_def = helper.make_graph(
             nodes=self._nodes,
-            name='YOLOv3-608',
+            name=self.model_name,
             inputs=inputs,
             outputs=outputs,
             initializer=initializer
@@ -385,6 +479,7 @@ class GraphBuilderONNX(object):
         else:
             node_creators = dict()
             node_creators['convolutional'] = self._make_conv_node
+            node_creators['maxpool'] = self._make_maxpool_node
             node_creators['shortcut'] = self._make_shortcut_node
             node_creators['route'] = self._make_route_node
             node_creators['upsample'] = self._make_upsample_node
@@ -599,22 +694,56 @@ class GraphBuilderONNX(object):
         layer_dict -- a layer parameter dictionary (one element of layer_configs)
         """
         upsample_factor = float(layer_dict['stride'])
+        # Create the scales array with node parameters
+        scales=np.array([1.0, 1.0, upsample_factor, upsample_factor]).astype(np.float32)
         previous_node_specs = self._get_previous_node_specs()
         inputs = [previous_node_specs.name]
+
         channels = previous_node_specs.channels
         assert channels > 0
+        upsample_params = UpsampleParams(layer_name, scales)
+        scales_name = upsample_params.generate_param_name()
+        # For ONNX opset >= 9, the Upsample node takes the scales array as an input.
+        inputs.append(scales_name)
+
         upsample_node = helper.make_node(
             'Upsample',
             mode='nearest',
-            # For ONNX versions <0.7.0, Upsample nodes accept different parameters than 'scales':
-            scales=[1.0, 1.0, upsample_factor, upsample_factor],
             inputs=inputs,
             outputs=[layer_name],
             name=layer_name,
         )
         self._nodes.append(upsample_node)
+        self.param_dict[layer_name] = upsample_params
         return layer_name, channels
 
+    def _make_maxpool_node(self, layer_name, layer_dict):
+        """Create an ONNX Maxpool node with the properties from
+        the DarkNet-based graph.
+
+        Keyword arguments:
+        layer_name -- the layer's name (also the corresponding key in layer_configs)
+        layer_dict -- a layer parameter dictionary (one element of layer_configs)
+        """
+        stride = layer_dict['stride']
+        kernel_size = layer_dict['size']
+        previous_node_specs = self._get_previous_node_specs()
+        inputs = [previous_node_specs.name]
+        channels = previous_node_specs.channels
+        kernel_shape = [kernel_size, kernel_size]
+        strides = [stride, stride]
+        assert channels > 0
+        maxpool_node = helper.make_node(
+            'MaxPool',
+            inputs=inputs,
+            outputs=[layer_name],
+            kernel_shape=kernel_shape,
+            strides=strides,
+            auto_pad='SAME_UPPER',
+            name=layer_name,
+        )
+        self._nodes.append(maxpool_node)
+        return layer_name, channels
 
 def generate_md5_checksum(local_path):
     """Returns the MD5 checksum of a local file.
@@ -622,91 +751,70 @@ def generate_md5_checksum(local_path):
     Keyword argument:
     local_path -- path of the file whose checksum shall be generated
     """
-    with open(local_path) as local_file:
+    with open(local_path, 'rb') as local_file:
         data = local_file.read()
         return hashlib.md5(data).hexdigest()
 
 
-def download_file(local_path, link, checksum_reference=None):
-    """Checks if a local file is present and downloads it from the specified path otherwise.
-    If checksum_reference is specified, the file's md5 checksum is compared against the
-    expected value.
+def main():
+    """Run the DarkNet-to-ONNX conversion for YOLOv3."""
+    if sys.version_info[0] < 3:
+        raise Exception('This modified version of yolov3_to_onnx.py script is only compatible with python3...')
 
-    Keyword arguments:
-    local_path -- path of the file whose checksum shall be generated
-    link -- link where the file shall be downloaded from if it is not found locally
-    checksum_reference -- expected MD5 checksum of the file
-    """
-    if not os.path.exists(local_path):
-        print('Downloading from %s, this may take a while...' % link)
-        wget.download(link, local_path)
-        print()
-    if checksum_reference is not None:
-        checksum = generate_md5_checksum(local_path)
-        if checksum != checksum_reference:
-            raise ValueError(
-                'The MD5 checksum of local file %s differs from %s, please manually remove \
-                 the file and try again.' %
-                (local_path, checksum_reference))
-    return local_path
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', type=str, default='yolov3-608',
+                        choices=['yolov3-288', 'yolov3-416', 'yolov3-608',
+                                 'yolov3-tiny-288', 'yolov3-tiny-416'])
+    args = parser.parse_args()
+
+    cfg_file_path = 'yolo-comap.cfg' #'%s.cfg' % args.model
+    weights_file_path = 'yolo-comap_best.weights' #'%s.weights' % args.model
+    output_file_path = 'yolo-comap_best.onnx' #'%s.onnx' % args.model
+    yolo_dim = int(args.model.split('-')[-1])  # 288, 416 or 608
+
+    # These are the only layers DarkNetParser will extract parameters from. The three layers of
+    # type 'yolo' are not parsed in detail because they are included in the post-processing later:
+    supported_layers = ['net', 'convolutional', 'maxpool',
+                        'shortcut', 'route', 'upsample']
+
+    # Create a DarkNetParser object, and the use it to generate an OrderedDict with all
+    # layer's configs from the cfg file:
+    parser = DarkNetParser(supported_layers)
+    layer_configs = parser.parse_cfg_file(cfg_file_path)
+    # We do not need the parser anymore after we got layer_configs:
+    del parser
+
+    # In above layer_config, there are three outputs that we need to know the output
+    # shape of (in CHW format):
+    output_tensor_dims = OrderedDict()
+    d = yolo_dim
+
+    if 'tiny' in args.model:
+        output_tensor_dims['016_convolutional'] = [255, d // 32, d // 32]
+        output_tensor_dims['023_convolutional'] = [255, d // 16, d // 16]
+    else:
+        output_tensor_dims['082_convolutional'] = [33, d // 32, d // 32]
+        output_tensor_dims['094_convolutional'] = [33, d // 16, d // 16]
+        output_tensor_dims['106_convolutional'] = [33, d //  8, d //  8]
+
+    # Create a GraphBuilderONNX object with the known output tensor dimensions:
+    builder = GraphBuilderONNX(args.model, output_tensor_dims)
+
+    # Now generate an ONNX graph with weights from the previously parsed layer configurations
+    # and the weights file:
+    yolov3_model_def = builder.build_onnx_graph(
+        layer_configs=layer_configs,
+        weights_file_path=weights_file_path,
+        verbose=True)
+    # Once we have the model definition, we do not need the builder anymore:
+    del builder
+
+    # Perform a sanity check on the ONNX model definition:
+    onnx.checker.check_model(yolov3_model_def)
+
+    # Serialize the generated ONNX graph to this file:
+    onnx.save(yolov3_model_def, output_file_path)
 
 
-"""Run the DarkNet-to-ONNX conversion for YOLOv3-608."""
-# Have to use python 2 due to hashlib compatibility
-# if sys.version_info[0] > 2:
-    # raise Exception("This is script is only compatible with python2, please re-run this script \
-# with python2. The rest of this sample can be run with either version of python")
-
-# Download the config for YOLOv3 if not present yet, and analyze the checksum:
-# cfg_file_path = download_file(
-    # 'yolov3.cfg',
-    # 'https://raw.githubusercontent.com/pjreddie/darknet/f86901f6177dfc6116360a13cc06ab680e0c86b0/cfg/yolov3.cfg',
-    # 'b969a43a848bbf26901643b833cfb96c')
-
-# These are the only layers DarkNetParser will extract parameters from. The three layers of
-# type 'yolo' are not parsed in detail because they are included in the post-processing later:
-supported_layers = ['net', 'convolutional', 'shortcut',
-                    'route', 'upsample']
-
-# Create a DarkNetParser object, and the use it to generate an OrderedDict with all
-# layer's configs from the cfg file:
-parser = DarkNetParser(supported_layers)
-# layer_configs = parser.parse_cfg_file(cfg_file_path)
-layer_configs = parser.parse_cfg_file("./yolov3.cfg")
-# We do not need the parser anymore after we got layer_configs:
-del parser
-
-# In above layer_config, there are three outputs that we need to know the output
-# shape of (in CHW format):
-output_tensor_dims = OrderedDict()
-output_tensor_dims['082_convolutional'] = [255, 19, 19]
-output_tensor_dims['094_convolutional'] = [255, 38, 38]
-output_tensor_dims['106_convolutional'] = [255, 76, 76]
-
-# Create a GraphBuilderONNX object with the known output tensor dimensions:
-builder = GraphBuilderONNX(output_tensor_dims)
-
-# We want to populate our network with weights later, that's why we download those from
-# the official mirror (and verify the checksum):
-# weights_file_path = download_file(
-    # 'yolov3.weights',
-    # 'https://pjreddie.com/media/files/yolov3.weights',
-    # 'c84e5b99d0e52cd466ae710cadf6d84c')
-
-# Now generate an ONNX graph with weights from the previously parsed layer configurations
-# and the weights file:
-yolov3_model_def = builder.build_onnx_graph(
-    layer_configs=layer_configs,
-    weights_file_path="/home/yang/test/yolov3.weights",
-    verbose=True)
-# Once we have the model definition, we do not need the builder anymore:
-del builder
-
-# Perform a sanity check on the ONNX model definition:
-# onnx.checker.check_model(yolov3_model_def)
-
-# Serialize the generated ONNX graph to this file:
-output_file_path = 'yolov3.onnx'
-with open(output_file_path, 'wb') as f:
-    f.write(yolov3_model_def.SerializeToString())
-
+if __name__ == '__main__':
+    main()
